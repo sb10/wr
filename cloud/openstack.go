@@ -73,7 +73,7 @@ const invalidFlavorIDMsg = "invalid flavor ID"
 var openstackValidResourceNameRegexp = regexp.MustCompile(`^[\w -]+$`)
 
 // openstackEnvs contains the environment variable names we need to connect to
-// OpenStack. These are only the required ones for all intalls; other env vars
+// OpenStack. These are only the required ones for all installs; other env vars
 // are required but it varies which ones. Gophercloud also considers:
 // OS_USERID, OS_TENANT_ID, OS_TENANT_NAME, OS_DOMAIN_ID, OS_DOMAIN_NAME,
 // OS_PROJECT_ID, OS_PROJECT_NAME (with *PROJECT* overriding *TENANT*, and only

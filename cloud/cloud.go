@@ -21,7 +21,8 @@ Package cloud provides functions to interact with cloud providers, used to
 create cloud resources so that you can spawn servers, then delete those
 resources when you're done.
 
-Currently implemented providers are OpenStack, with AWS planned for the future.
+Currently implemented providers are OpenStack and Google Compute Engine (GCE),
+with AWS planned for the future.
 The implementation of each supported provider is in its own .go file.
 
 It's a pseudo plug-in system in that it is designed so that you can easily add a
@@ -141,6 +142,7 @@ const touchStampFormat = "200601021504.05"
 var hostNameRegex = regexp.MustCompile(`[^a-z0-9\-]+`)
 
 const openstackName = "openstack"
+const gceName = "gce"
 
 // Error records an error and the operation and provider caused it.
 type Error struct {
@@ -301,10 +303,11 @@ func AllEnv(providerName string) ([]string, error) {
 }
 
 // New creates a new Provider to interact with the given cloud provider.
-// Possible names so far are "openstack" ("aws" is planned). You must provide a
-// resource name that will be used to name any created cloud resources. You must
-// also provide a file path prefix to save details of created resources to (the
-// actual file created will be suffixed with your resourceName).
+// Possible names so far are "openstack" and "gce" ("aws" is planned). You must
+// provide a resource name that will be used to name any created cloud
+// resources. You must also provide a file path prefix to save details of
+// created resources to (the actual file created will be suffixed with your
+// resourceName).
 //
 // Note that the file could contain created private key details, so should be
 // kept accessible only by you.
@@ -317,6 +320,8 @@ func New(name string, resourceName string, savePath string, logger ...log15.Logg
 	switch name {
 	case openstackName:
 		p = &Provider{impl: new(openstackp)}
+	case gceName:
+		p = &Provider{impl: new(gcep)}
 	default:
 		return nil, Error{name, "New", ErrBadProvider}
 	}

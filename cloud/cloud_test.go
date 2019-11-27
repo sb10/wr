@@ -49,6 +49,41 @@ func TestUtility(t *testing.T) {
 	})
 }
 
+func TestGCE(t *testing.T) {
+	osPrefix := os.Getenv("OS_OS_PREFIX")
+	osUser := os.Getenv("OS_OS_USERNAME")
+	localUser := os.Getenv("OS_LOCAL_USERNAME")
+	// host, errh := os.Hostname()
+	// if errh != nil {
+	// 	t.Fatal(errh)
+	// }
+	resourceName := "wr-testing-" + localUser
+
+	if osPrefix == "" || osUser == "" || localUser == "" {
+		SkipConvey("Without our special OS_OS_PREFIX, OS_OS_USERNAME and OS_LOCAL_USERNAME environment variables, we'll skip GCE tests", t, func() {})
+	} else {
+		crdir, err := ioutil.TempDir("", "wr_testing_cr")
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer os.RemoveAll(crdir)
+		crfileprefix := filepath.Join(crdir, "resources")
+
+		Convey("You can get a new GCE Provider", t, func() {
+			p, err := New("gce", resourceName, crfileprefix, testLogger)
+			So(err, ShouldBeNil)
+			So(p, ShouldNotBeNil)
+
+			Convey("You can get a public image by family name", func() {
+				gce := p.impl.(*gcep)
+				image, err := gce.getImage("centos-8")
+				So(err, ShouldBeNil)
+				So(image.Family, ShouldEqual, "centos-8")
+			})
+		})
+	}
+}
+
 func TestOpenStack(t *testing.T) {
 	osPrefix := os.Getenv("OS_OS_PREFIX")
 	osUser := os.Getenv("OS_OS_USERNAME")
