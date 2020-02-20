@@ -119,9 +119,9 @@ func (p *gcep) initialize(logger log15.Logger) error {
 	return err
 }
 
-// cacheFlavors retrieves the current list of flavors from OpenStack and caches
-// them in p. Old no-longer existent flavors are kept forever, so we can still
-// see what resources old instances are using.
+// cacheFlavors retrieves the current list of flavors from GCE and caches them
+// in p. Old no-longer existent flavors are kept forever, so we can still see
+// what resources old instances are using.
 func (p *gcep) cacheFlavors() error {
 	p.fmapMutex.Lock()
 	defer func() {
@@ -269,7 +269,6 @@ func (p *gcep) deploy(resources *Resources, requiredPorts []int, useConfigDrive 
 
 	// don't create any more resources if we're already running in GCE
 	if p.inCloud() {
-
 		return nil
 	}
 
@@ -319,7 +318,7 @@ func (p *gcep) getCurrentServers(resources *Resources) ([][]string, error) {
 	return sdetails, nil
 }
 
-// inCloud checks if we're currently running on an OpenStack server based on our
+// inCloud checks if we're currently running on an GCE server based on our
 // hostname matching a host in GCE.
 func (p *gcep) inCloud() bool {
 	// hostname, err := os.Hostname()
