@@ -22,18 +22,18 @@ create cloud resources so that you can spawn servers, then delete those
 resources when you're done.
 
 Currently implemented providers are OpenStack and Google Compute Engine (GCE),
-with AWS planned for the future.
-The implementation of each supported provider is in its own .go file.
+with AWS planned for the future. The implementation of each supported provider
+is in its own .go file.
 
 It's a pseudo plug-in system in that it is designed so that you can easily add a
-go file that implements the methods of the provideri interface, to support a
-new cloud provider. On the other hand, there is no dynamic loading of these go
+go file that implements the methods of the provideri interface, to support a new
+cloud provider. On the other hand, there is no dynamic loading of these go
 files; they are all imported (they all belong to the cloud package), and the
 correct one used at run time. To "register" a new provideri implementation you
-must add a case for it to New() and RequiredEnv() and rebuild. The spawn()
-method must create a file at the path sentinelFilePath once the system has
-finalised its boot up and is fully ready to use. The system should be configured
-to allow user fuse mounts.
+must add a case for it to nameToProvider() and rebuild. The spawn() method must
+create a file at the path sentinelFilePath once the system has finalised its
+boot up and is fully ready to use. The system should be configured to allow user
+fuse mounts.
 
 Please note that the methods in this package are NOT safe to be used by more
 than 1 process at a time.
@@ -42,7 +42,7 @@ than 1 process at a time.
 
     // deploy
     provider, err := cloud.New("openstack", "wr-prod-username",
-		"/home/username/.wr-production/created_cloud_resources")
+        "/home/username/.wr-production/created_cloud_resources")
     err = provider.Deploy(&cloud.DeployConfig{
         RequiredPorts:  []int{22},
         GatewayIP:      "192.168.0.1",
@@ -89,6 +89,22 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/inconshreveable/log15"
 )
+
+// nameToProvider translates from name to a provideri implementation. methodName
+// will be included in any error returned.
+func nameToProvider(name string, methodName string) (*Provider, error) {
+	var p *Provider
+	switch name {
+	case openstackName:
+		p = &Provider{impl: new(openstackp)}
+	case gceName:
+		p = &Provider{impl: new(gcep)}
+	default:
+		return nil, Error{name, methodName, ErrBadProvider}
+	}
+	p.Name = name
+	return p, nil
+}
 
 // Err* constants are found in the returned Errors under err.Err, so you can
 // cast and check if it's a certain type of error. ErrMissingEnv gets appended
@@ -261,12 +277,9 @@ type DeployConfig struct {
 // RequiredEnv returns the environment variables that are needed by the given
 // provider before New() will work for it. See New() for possible providerNames.
 func RequiredEnv(providerName string) ([]string, error) {
-	var p *Provider
-	switch providerName {
-	case openstackName:
-		p = &Provider{impl: new(openstackp)}
-	default:
-		return nil, Error{providerName, "RequiredEnv", ErrBadProvider}
+	p, err := nameToProvider(providerName, "RequiredEnv")
+	if err != nil {
+		return nil, err
 	}
 	return p.impl.requiredEnv(), nil
 }
@@ -275,12 +288,9 @@ func RequiredEnv(providerName string) ([]string, error) {
 // provider. If one of these is actually needed but not provided, errors may
 // appear from New() or later in subsequent attempted method usage.
 func MaybeEnv(providerName string) ([]string, error) {
-	var p *Provider
-	switch providerName {
-	case openstackName:
-		p = &Provider{impl: new(openstackp)}
-	default:
-		return nil, Error{providerName, "MaybeEnv", ErrBadProvider}
+	p, err := nameToProvider(providerName, "MaybeEnv")
+	if err != nil {
+		return nil, err
 	}
 	return p.impl.maybeEnv(), nil
 }
@@ -288,12 +298,9 @@ func MaybeEnv(providerName string) ([]string, error) {
 // AllEnv returns the environment variables that RequiredEnv() and MaybeEnv()
 // would return.
 func AllEnv(providerName string) ([]string, error) {
-	var p *Provider
-	switch providerName {
-	case openstackName:
-		p = &Provider{impl: new(openstackp)}
-	default:
-		return nil, Error{providerName, "MaybeEnv", ErrBadProvider}
+	p, err := nameToProvider(providerName, "AllEnv")
+	if err != nil {
+		return nil, err
 	}
 
 	var all []string
@@ -316,17 +323,11 @@ func AllEnv(providerName string) ([]string, error) {
 // with any "harmless" or unreturnable errors. If not supplied, we use a default
 // logger that discards all log messages.
 func New(name string, resourceName string, savePath string, logger ...log15.Logger) (*Provider, error) {
-	var p *Provider
-	switch name {
-	case openstackName:
-		p = &Provider{impl: new(openstackp)}
-	case gceName:
-		p = &Provider{impl: new(gcep)}
-	default:
-		return nil, Error{name, "New", ErrBadProvider}
+	p, err := nameToProvider(name, "New")
+	if err != nil {
+		return nil, err
 	}
 
-	p.Name = name
 	p.savePath = savePath + "." + resourceName
 
 	var l log15.Logger
@@ -340,7 +341,6 @@ func New(name string, resourceName string, savePath string, logger ...log15.Logg
 
 	// load any resources we previously saved, or get an empty set to work
 	// with
-	var err error
 	p.resources, err = p.loadResources(resourceName)
 	if err != nil {
 		return nil, err
