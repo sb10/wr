@@ -84,7 +84,6 @@ var openstackMaybeEnvs = [...]string{"OS_USERID", "OS_TENANT_ID", "OS_TENANT_NAM
 
 // openstackp is our implementer of provideri
 type openstackp struct {
-	lastFlavorCache   time.Time
 	externalNetworkID string
 	networkName       string
 	networkUUID       string
@@ -97,19 +96,17 @@ type openstackp struct {
 	log15.Logger
 	computeClient   *gophercloud.ServiceClient
 	errorBackoff    *backoff.Backoff
-	fmap            map[string]*Flavor
-	imap            map[string]*images.Image
 	ipNet           *net.IPNet
 	networkClient   *gophercloud.ServiceClient
 	ownServer       *servers.Server
-	fmapMutex       sync.RWMutex
-	imapMutex       sync.RWMutex
 	stMutex         sync.RWMutex
 	spMutex         sync.RWMutex
 	createdKeyPair  bool
 	useConfigDrive  bool
 	hasDefaultGroup bool
 	spawnFailed     bool
+	flavorCache     *Cache
+	imageCache      *Cache
 }
 
 // requiredEnv returns envs that are definitely required.
@@ -186,10 +183,10 @@ func (p *openstackp) initialize(logger log15.Logger) error {
 		return err
 	}
 
-	// flavors and images are retrieved on-demand via caching methods that store
-	// in these maps
-	p.fmap = make(map[string]*Flavor)
-	p.imap = make(map[string]*images.Image)
+	// flavors and images are retrieved on-demand via cache
+	p.flavorCache = NewCache(p.getFlavors, CacheDefaultRefresh)
+	p.imageCache = NewCache(p.getImages, CacheDefaultRefresh)
+	p.imageCache.SetPrefixCallback(p.prefixMatchImage)
 
 	// to get a reasonable new server timeout we'll keep track of how long it
 	// takes to spawn them using an exponentially weighted moving average. We
@@ -210,16 +207,9 @@ func (p *openstackp) initialize(logger log15.Logger) error {
 	return err
 }
 
-// cacheFlavors retrieves the current list of flavors from OpenStack and caches
-// them in p. Old no-longer existent flavors are kept forever, so we can still
-// see what resources old instances are using.
-func (p *openstackp) cacheFlavors() error {
-	p.fmapMutex.Lock()
-	defer func() {
-		p.lastFlavorCache = time.Now()
-		p.fmapMutex.Unlock()
-	}()
-
+// getFlavors is a CurrentResourceCallback for getting the current list of
+// flavors from OpenStack.
+func (p *openstackp) getFlavors(resourceMap map[string]interface{}) error {
 	pager := flavors.ListDetail(p.computeClient, flavors.ListOpts{})
 	return pager.EachPage(func(page pagination.Page) (bool, error) {
 		flavorList, err := flavors.ExtractFlavors(page)
@@ -228,7 +218,7 @@ func (p *openstackp) cacheFlavors() error {
 		}
 
 		for _, f := range flavorList {
-			p.fmap[f.ID] = &Flavor{
+			resourceMap[f.ID] = &Flavor{
 				ID:    f.ID,
 				Name:  f.Name,
 				Cores: f.VCPUs,
@@ -240,35 +230,21 @@ func (p *openstackp) cacheFlavors() error {
 	})
 }
 
-// getFlavor retrieves the desired flavor by id from the cache. If it's not in
-// the cache, will call cacheFlavors() to get any newly added flavors. If still
-// not in the cache, returns nil and an error.
+// getFlavor retrieves the desired flavor by id (potentially cached).
 func (p *openstackp) getFlavor(flavorID string) (*Flavor, error) {
-	p.fmapMutex.RLock()
-	flavor, found := p.fmap[flavorID]
-	p.fmapMutex.RUnlock()
-	if !found {
-		err := p.cacheFlavors()
-		if err != nil {
-			return nil, err
-		}
-
-		p.fmapMutex.RLock()
-		flavor, found = p.fmap[flavorID]
-		p.fmapMutex.RUnlock()
-		if !found {
-			return nil, errors.New(invalidFlavorIDMsg + ": " + flavorID)
-		}
+	resource, err := p.flavorCache.Get(flavorID)
+	if err != nil {
+		return nil, err
 	}
-	return flavor, nil
+	if resource == nil {
+		return nil, errors.New(invalidFlavorIDMsg + ": " + flavorID)
+	}
+	return resource.(*Flavor), nil
 }
 
-// cacheImages retrieves the current list of images from OpenStack and caches
-// them in p. Old no-longer existent images are kept forever, so we can still
-// see what images old instances are using.
-func (p *openstackp) cacheImages() error {
-	p.imapMutex.Lock()
-	defer p.imapMutex.Unlock()
+// getImages is a CurrentResourceCallback for getting the current list of
+// images from OpenStack.
+func (p *openstackp) getImages(resourceMap map[string]interface{}) error {
 	pager := images.ListDetail(p.computeClient, images.ListOpts{Status: "ACTIVE"})
 	return pager.EachPage(func(page pagination.Page) (bool, error) {
 		imageList, errf := images.ExtractImages(page)
@@ -279,54 +255,35 @@ func (p *openstackp) cacheImages() error {
 		for _, i := range imageList {
 			if i.Progress == 100 {
 				thisI := i // copy before storing ref
-				p.imap[i.ID] = &thisI
-				p.imap[i.Name] = &thisI
+				resourceMap[i.ID] = &thisI
+				resourceMap[i.Name] = &thisI
 			}
 		}
-
 		return true, nil
 	})
 }
 
-// getImage retrieves the desired image by name or id prefix from the cache. If
-// it's not in the cache, will call cacheImages() to get any newly added images.
-// If still not in the cache, returns nil and an error.
+// getImage retrieves the desired image by name or id prefix (potentially
+// cached).
 func (p *openstackp) getImage(prefix string) (*images.Image, error) {
-	image := p.getImageFromCache(prefix)
-	if image != nil {
-		return image, nil
-	}
-
-	err := p.cacheImages()
+	resource, err := p.imageCache.Get(prefix)
 	if err != nil {
 		return nil, err
 	}
-
-	image = p.getImageFromCache(prefix)
-	if image != nil {
-		return image, nil
+	if resource == nil {
+		return nil, errors.New("no OS image with prefix [" + prefix + "] was found")
 	}
-
-	return nil, errors.New("no OS image with prefix [" + prefix + "] was found")
+	return resource.(*images.Image), nil
 }
 
-// getImageFromCache is used by getImage(); don't call this directly.
-func (p *openstackp) getImageFromCache(prefix string) *images.Image {
-	p.imapMutex.RLock()
-	defer p.imapMutex.RUnlock()
-
-	// find an exact match
-	if i, found := p.imap[prefix]; found {
-		return i
+// prefixMatchImage is a PrefixCallback for prefix-matching images against
+// their Names or IDs.
+func (p *openstackp) prefixMatchImage(resource interface{}, prefix string) bool {
+	image := resource.(*images.Image)
+	if strings.HasPrefix(image.Name, prefix) || strings.HasPrefix(image.ID, prefix) {
+		return true
 	}
-
-	// failing that, find a random prefix match
-	for _, i := range p.imap {
-		if strings.HasPrefix(i.Name, prefix) || strings.HasPrefix(i.ID, prefix) {
-			return i
-		}
-	}
-	return nil
+	return false
 }
 
 // deploy achieves the aims of Deploy().
@@ -651,21 +608,15 @@ func (p *openstackp) inCloud() bool {
 
 // flavors returns all our flavors.
 func (p *openstackp) flavors() map[string]*Flavor {
-	// update the cached flavors at most once every half hour
-	p.fmapMutex.RLock()
-	if time.Since(p.lastFlavorCache) > 30*time.Minute {
-		p.fmapMutex.RUnlock()
-		err := p.cacheFlavors()
-		if err != nil {
-			p.Warn("failed to cache available flavors", "err", err)
-		}
-		p.fmapMutex.RLock()
+	resources, err := p.flavorCache.Resources()
+	if err != nil {
+		p.Warn("failed to refresh latest flavors", "err", err)
 	}
+
 	fmap := make(map[string]*Flavor)
-	for key, val := range p.fmap {
-		fmap[key] = val
+	for key, val := range resources {
+		fmap[key] = val.(*Flavor)
 	}
-	p.fmapMutex.RUnlock()
 	return fmap
 }
 
@@ -685,10 +636,6 @@ func (p *openstackp) getQuota() (*Quota, error) {
 
 	// query all servers to figure out what we've used of our quota
 	// (*** gophercloud currently doesn't implement getting this properly)
-	err = p.cacheFlavors()
-	if err != nil {
-		p.Warn("failed to cache available flavors", "err", err)
-	}
 	pager := servers.List(p.computeClient, servers.ListOpts{})
 	err = pager.EachPage(func(page pagination.Page) (bool, error) {
 		serverList, errf := servers.ExtractServers(page)

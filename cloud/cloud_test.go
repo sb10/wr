@@ -49,9 +49,109 @@ func TestUtility(t *testing.T) {
 	})
 }
 
+func TestCache(t *testing.T) {
+	Convey("You can make a new resource Cache", t, func() {
+		t := time.Now()
+		crcb := func(resourceMap map[string]interface{}) error {
+			s := time.Since(t)
+			switch {
+			case s < 50*time.Millisecond:
+				resourceMap["a"] = 1
+				resourceMap["b"] = 2
+			case s < 150*time.Millisecond:
+				resourceMap["a"] = 0
+				resourceMap["c"] = 3
+			default:
+				return fmt.Errorf("an error")
+			}
+			return nil
+		}
+
+		cache := NewCache(crcb, 100*time.Millisecond)
+
+		Convey("You can Get() new resources as soon as they are available", func() {
+			r, err := cache.Get("a")
+			So(err, ShouldBeNil)
+			So(r.(int), ShouldEqual, 1)
+
+			r, err = cache.Get("b")
+			So(err, ShouldBeNil)
+			So(r.(int), ShouldEqual, 2)
+
+			r, err = cache.Get("c")
+			So(err, ShouldBeNil)
+			So(r, ShouldBeNil)
+
+			<-time.After(60 * time.Millisecond)
+
+			r, err = cache.Get("a")
+			So(err, ShouldBeNil)
+			So(r.(int), ShouldEqual, 1) // still get the cached one
+
+			r, err = cache.Get("b")
+			So(err, ShouldBeNil)
+			So(r.(int), ShouldEqual, 2)
+
+			r, err = cache.Get("c")
+			So(err, ShouldBeNil)
+			So(r.(int), ShouldEqual, 3)
+
+			r, err = cache.Get("a")
+			So(err, ShouldBeNil)
+			So(r.(int), ShouldEqual, 0) // now we get the new one since c forced a refresh
+
+			<-time.After(110 * time.Millisecond)
+
+			r, err = cache.Get("a")
+			So(err, ShouldNotBeNil)
+			So(r.(int), ShouldEqual, 0)
+
+			r, err = cache.Get("d")
+			So(err, ShouldNotBeNil)
+			So(r, ShouldBeNil)
+		})
+
+		Convey("You can Get() updated resources after the refresh time", func() {
+			r, err := cache.Get("a")
+			So(err, ShouldBeNil)
+			So(r.(int), ShouldEqual, 1)
+
+			<-time.After(60 * time.Millisecond)
+
+			r, err = cache.Get("a")
+			So(err, ShouldBeNil)
+			So(r.(int), ShouldEqual, 1) // still get the cached one
+
+			<-time.After(60 * time.Millisecond)
+
+			r, err = cache.Get("a")
+			So(err, ShouldBeNil)
+			So(r.(int), ShouldEqual, 0) // now get new once since refresh time passed
+		})
+
+		Convey("You can get all Resources(), updating after the refresh time", func() {
+			r, err := cache.Resources()
+			So(err, ShouldBeNil)
+			So(len(r), ShouldEqual, 2)
+
+			<-time.After(60 * time.Millisecond)
+
+			r, err = cache.Resources()
+			So(err, ShouldBeNil)
+			So(len(r), ShouldEqual, 2) // c not there yet
+
+			<-time.After(60 * time.Millisecond)
+
+			r, err = cache.Resources()
+			So(err, ShouldBeNil)
+			So(len(r), ShouldEqual, 3) // now get new once since refresh time passed
+		})
+	})
+}
+
 func TestGCE(t *testing.T) {
-	osPrefix := os.Getenv("OS_OS_PREFIX")
-	osUser := os.Getenv("OS_OS_USERNAME")
+	creds := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+	// osUser := os.Getenv("OS_OS_USERNAME")
 	localUser := os.Getenv("OS_LOCAL_USERNAME")
 	// host, errh := os.Hostname()
 	// if errh != nil {
@@ -59,8 +159,8 @@ func TestGCE(t *testing.T) {
 	// }
 	resourceName := "wr-testing-" + localUser
 
-	if osPrefix == "" || osUser == "" || localUser == "" {
-		SkipConvey("Without our special OS_OS_PREFIX, OS_OS_USERNAME and OS_LOCAL_USERNAME environment variables, we'll skip GCE tests", t, func() {})
+	if creds == "" || localUser == "" {
+		SkipConvey("Without GOOGLE_APPLICATION_CREDENTIALS and OS_OS_PREFIX environment variables, we'll skip GCE tests", t, func() {})
 	} else {
 		crdir, err := ioutil.TempDir("", "wr_testing_cr")
 		if err != nil {

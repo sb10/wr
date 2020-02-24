@@ -1,4 +1,4 @@
-// Copyright © 2019 Genome Research Limited
+// Copyright © 2019-2020 Genome Research Limited
 // Author: Sendu Bala <sb10@sanger.ac.uk>.
 //
 //  This file is part of wr.
@@ -25,7 +25,6 @@ import (
 	"errors"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/VertebrateResequencing/wr/internal"
@@ -47,7 +46,6 @@ var publicImageProjects = [...]string{"gce-uefi-images", "centos-cloud", "cos-cl
 
 // gcep is our implementer of provideri
 type gcep struct {
-	lastFlavorCache   time.Time
 	externalNetworkID string
 	networkName       string
 	networkUUID       string
@@ -60,16 +58,14 @@ type gcep struct {
 	log15.Logger
 	computeClient   *compute.Service
 	errorBackoff    *backoff.Backoff
-	fmap            map[string]*Flavor
-	imap            map[string]*compute.Image
 	ipNet           *net.IPNet
 	ownServer       *servers.Server
-	fmapMutex       sync.RWMutex
-	imapMutex       sync.RWMutex
 	createdKeyPair  bool
 	useConfigDrive  bool
 	hasDefaultGroup bool
 	spawnFailed     bool
+	flavorCache     *Cache
+	imageCache      *Cache
 }
 
 // requiredEnv returns envs that are definitely required.
@@ -95,10 +91,10 @@ func (p *gcep) initialize(logger log15.Logger) error {
 		return err
 	}
 
-	// flavors and images are retrieved on-demand via caching methods that store
-	// in these maps
-	p.fmap = make(map[string]*Flavor)
-	p.imap = make(map[string]*compute.Image)
+	// flavors and images are retrieved on-demand via cache
+	p.flavorCache = NewCache(p.getFlavors, CacheDefaultRefresh)
+	p.imageCache = NewCache(p.getImages, CacheDefaultRefresh)
+	p.imageCache.SetPrefixCallback(p.prefixMatchImage)
 
 	// to get a reasonable new server timeout we'll keep track of how long it
 	// takes to spawn them using an exponentially weighted moving average. We
@@ -119,66 +115,16 @@ func (p *gcep) initialize(logger log15.Logger) error {
 	return err
 }
 
-// cacheFlavors retrieves the current list of flavors from GCE and caches them
-// in p. Old no-longer existent flavors are kept forever, so we can still see
-// what resources old instances are using.
-func (p *gcep) cacheFlavors() error {
-	p.fmapMutex.Lock()
-	defer func() {
-		p.lastFlavorCache = time.Now()
-		p.fmapMutex.Unlock()
-	}()
-
-	// pager := flavors.ListDetail(p.computeClient, flavors.ListOpts{})
-	// return pager.EachPage(func(page pagination.Page) (bool, error) {
-	// 	flavorList, err := flavors.ExtractFlavors(page)
-	// 	if err != nil {
-	// 		return false, err
-	// 	}
-
-	// 	for _, f := range flavorList {
-	// 		p.fmap[f.ID] = &Flavor{
-	// 			ID:    f.ID,
-	// 			Name:  f.Name,
-	// 			Cores: f.VCPUs,
-	// 			RAM:   f.RAM,
-	// 			Disk:  f.Disk,
-	// 		}
-	// 	}
-	// 	return true, nil
-	// })
+// getFlavors is a CurrentResourceCallback for getting the current list of
+// flavors from GCE.
+func (p *gcep) getFlavors(resourceMap map[string]interface{}) error {
+	// *** not yet implemented
 	return nil
 }
 
-// getFlavor retrieves the desired flavor by id from the cache. If it's not in
-// the cache, will call cacheFlavors() to get any newly added flavors. If still
-// not in the cache, returns nil and an error.
-func (p *gcep) getFlavor(flavorID string) (*Flavor, error) {
-	p.fmapMutex.RLock()
-	flavor, found := p.fmap[flavorID]
-	p.fmapMutex.RUnlock()
-	if !found {
-		err := p.cacheFlavors()
-		if err != nil {
-			return nil, err
-		}
-
-		p.fmapMutex.RLock()
-		flavor, found = p.fmap[flavorID]
-		p.fmapMutex.RUnlock()
-		if !found {
-			return nil, errors.New(invalidFlavorIDMsg + ": " + flavorID)
-		}
-	}
-	return flavor, nil
-}
-
-// cacheImages retrieves the current list of images from GCE and caches them in
-// p. Old no-longer existent images are kept forever, so we can still see what
-// images old instances are using.
-func (p *gcep) cacheImages() error {
-	p.imapMutex.Lock()
-	defer p.imapMutex.Unlock()
+// getImages is a CurrentResourceCallback for getting the current list of
+// images from GCE.
+func (p *gcep) getImages(resourceMap map[string]interface{}) error {
 	// *** need to know user's own project name to also list images in that
 	for _, project := range publicImageProjects {
 		imageList, err := p.computeClient.Images.List(project).Do()
@@ -190,53 +136,31 @@ func (p *gcep) cacheImages() error {
 				if image.Status != "READY" || (image.Deprecated != nil && image.Deprecated.State != "ACTIVE") {
 					continue
 				}
-				p.imap[image.Family] = image
-				p.imap[image.Name] = image
+				resourceMap[image.Family] = image
+				resourceMap[image.Name] = image
 			}
 		}
 	}
 	return nil
 }
 
-// getImage retrieves the desired image by name prefix from the cache. If it's
-// not in the cache, will call cacheImages() to get any newly added images. If
-// still not in the cache, returns nil and an error.
+// getImage retrieves the desired image by name prefix (possibly cached).
 func (p *gcep) getImage(prefix string) (*compute.Image, error) {
-	image := p.getImageFromCache(prefix)
-	if image != nil {
-		return image, nil
-	}
-
-	err := p.cacheImages()
+	resource, err := p.imageCache.Get(prefix)
 	if err != nil {
 		return nil, err
 	}
-
-	image = p.getImageFromCache(prefix)
-	if image != nil {
-		return image, nil
+	if resource == nil {
+		return nil, errors.New("no GCE image with prefix [" + prefix + "] was found")
 	}
-
-	return nil, errors.New("no image with prefix [" + prefix + "] was found")
+	return resource.(*compute.Image), nil
 }
 
-// getImageFromCache is used by getImage(); don't call this directly.
-func (p *gcep) getImageFromCache(prefix string) *compute.Image {
-	p.imapMutex.RLock()
-	defer p.imapMutex.RUnlock()
-
-	// find an exact match
-	if image, found := p.imap[prefix]; found {
-		return image
-	}
-
-	// failing that, find a random prefix match
-	for _, image := range p.imap {
-		if strings.HasPrefix(image.Name, prefix) {
-			return image
-		}
-	}
-	return nil
+// prefixMatchImage is a PrefixCallback for prefix-matching images against
+// their Names.
+func (p *gcep) prefixMatchImage(resource interface{}, prefix string) bool {
+	image := resource.(*compute.Image)
+	return strings.HasPrefix(image.Name, prefix)
 }
 
 // deploy achieves the aims of Deploy().
@@ -354,21 +278,15 @@ func (p *gcep) inCloud() bool {
 
 // flavors returns all our flavors.
 func (p *gcep) flavors() map[string]*Flavor {
-	// update the cached flavors at most once every half hour
-	p.fmapMutex.RLock()
-	if time.Since(p.lastFlavorCache) > 30*time.Minute {
-		p.fmapMutex.RUnlock()
-		err := p.cacheFlavors()
-		if err != nil {
-			p.Warn("failed to cache available flavors", "err", err)
-		}
-		p.fmapMutex.RLock()
+	resources, err := p.flavorCache.Resources()
+	if err != nil {
+		p.Warn("failed to refresh latest flavors", "err", err)
 	}
+
 	fmap := make(map[string]*Flavor)
-	for key, val := range p.fmap {
-		fmap[key] = val
+	for key, val := range resources {
+		fmap[key] = val.(*Flavor)
 	}
-	p.fmapMutex.RUnlock()
 	return fmap
 }
 
